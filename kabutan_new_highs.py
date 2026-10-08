@@ -158,7 +158,12 @@ def find_prev_high(rows: list[PriceRow]) -> PriceRow | None:
 class Kabutan:
     def __init__(self, sleep: float = 1.0, timeout: float = 20.0):
         self.session = requests.Session()
-        self.session.headers["User-Agent"] = USER_AGENT
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+            "Referer": BASE_URL + "/",
+        })
         self.sleep = sleep
         self.timeout = timeout
 
@@ -167,6 +172,9 @@ class Kabutan:
             try:
                 time.sleep(self.sleep)
                 resp = self.session.get(url, timeout=self.timeout)
+                if resp.status_code in (403, 405):
+                    # WAF によるブロック。リトライしても変わらないので即失敗
+                    raise SystemExit(f"株探にアクセスを拒否されました (HTTP {resp.status_code}): {url}")
                 resp.raise_for_status()
                 resp.encoding = resp.apparent_encoding or "utf-8"
                 return resp.text
