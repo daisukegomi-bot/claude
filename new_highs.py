@@ -29,7 +29,8 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://finance.yahoo.co.jp"
 RANKING_URL = BASE_URL + "/stocks/ranking/yearToDateHigh?market=all&term=daily&page={page}"
-HISTORY_URL = BASE_URL + "/quote/{code}.T/history?timeFrame=d&page={page}"
+HISTORY_URL = BASE_URL + "/quote/{code}.T/history?timeFrame={frame}&page={page}"
+RANGE_SUFFIX = "&from={start:%Y%m%d}&to={end:%Y%m%d}"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -47,8 +48,9 @@ class Candidate:
 
 @dataclass
 class PriceRow:
-    date: dt.date
+    date: dt.date  # 週足では週の初日
     close: float  # 調整後終値
+    high: float  # 調整後高値（高値 × 調整後終値 / 終値）
 
 
 @dataclass
@@ -113,7 +115,7 @@ def parse_ranking(html: str) -> tuple[list[Candidate], bool]:
 
 
 def parse_history(html: str) -> list[PriceRow]:
-    """時系列ページの表 (#histlist) から (日付, 調整後終値) を新しい順に抽出する。
+    """時系列ページの表 (#histlist) から (日付, 調整後終値, 調整後高値) を新しい順に抽出する。
 
     列: 日付 | 始値 | 高値 | 安値 | 終値 | 出来高 | 調整後終値 | PER | PBR
     株式分割などの行（数値列が無い行）は無視する。
@@ -129,13 +131,15 @@ def parse_history(html: str) -> list[PriceRow]:
         tds = tr.find_all("td")
         if len(tds) < 4:
             continue
+        raw_close = _to_float(tds[3].get_text())
+        high = _to_float(tds[1].get_text())
         close = _to_float(tds[5].get_text()) if len(tds) > 5 else None
         if close is None:
-            close = _to_float(tds[3].get_text())
-        if close is None:
+            close = raw_close
+        if close is None or raw_close is None or high is None:
             continue
         date = dt.date(int(m[1]), int(m[2]), int(m[3]))
-        rows.setdefault(date, PriceRow(date, close))
+        rows.setdefault(date, PriceRow(date, close, high * close / raw_close))
     return sorted(rows.values(), key=lambda r: r.date, reverse=True)
 
 
@@ -192,30 +196,52 @@ class Yahoo:
                 break
         return list(out.values())
 
+    def history(self, code: str, frame: str, page: int,
+                start: dt.date | None = None, end: dt.date | None = None) -> list[PriceRow]:
+        url = HISTORY_URL.format(code=code, frame=frame, page=page)
+        if start and end:
+            url += RANGE_SUFFIX.format(start=start, end=end)
+        return parse_history(self.get(url))
+
     def check(self, cand: Candidate, min_days: int, max_years: int) -> Result | None:
-        rows: list[PriceRow] = []
-        page = 1
-        while True:
-            got = parse_history(self.get(HISTORY_URL.format(code=cand.code, page=page)))
-            got = [r for r in got if not rows or r.date < rows[-1].date]
-            if not got:
-                break
-            rows.extend(got)
-            prev = find_prev_high(rows)
-            if prev is not None:
-                if (rows[0].date - prev.date).days < min_days:
-                    return None  # 1年以内に同等以上の終値あり
-                break
-            if (rows[0].date - rows[-1].date).days >= max_years * 366:
-                break
-            page += 1
-        if len(rows) < 2:
+        """最新終値以上の終値を付けた直近の日を探す。
+
+        from/to を付けない時系列は直近1年で打ち切られるため、
+          1. 日足1ページ目（直近約1カ月）を直接確認
+          2. それより前は週足を遡り、調整後高値が最新終値以上の週だけ日足で確認
+        週の高値はその週のどの終値以上でもあるので取りこぼしは無い。
+        """
+        daily = self.history(cand.code, "d", 1)
+        if len(daily) < 2:
             return None
-        prev = find_prev_high(rows)
-        if prev is None and (rows[0].date - rows[-1].date).days < min_days:
-            # 上場1年未満などで判定期間に満たない
-            return None
-        latest = rows[0]
+        latest = daily[0]
+        prev = find_prev_high(daily)
+        oldest = daily[-1].date
+        if prev is None:
+            start = latest.date - dt.timedelta(days=max_years * 366)
+            page = 1
+            seen: set[dt.date] = set()
+            while prev is None:
+                weeks = [w for w in self.history(cand.code, "w", page, start, latest.date) if w.date not in seen]
+                if not weeks:
+                    break
+                for w in weeks:
+                    seen.add(w.date)
+                    if w.date >= daily[-1].date:
+                        continue  # 日足1ページ目で確認済み
+                    oldest = min(oldest, w.date)
+                    if w.high < latest.close:
+                        continue
+                    days = self.history(cand.code, "d", 1, w.date, min(w.date + dt.timedelta(days=6), latest.date))
+                    hits = [d for d in days if d.date < daily[-1].date and d.close >= latest.close]
+                    if hits:
+                        prev = max(hits, key=lambda d: d.date)
+                        break
+                page += 1
+        if prev is not None and (latest.date - prev.date).days < min_days:
+            return None  # 1年以内に同等以上の終値あり
+        if prev is None and (latest.date - oldest).days < min_days:
+            return None  # 上場1年未満などで判定期間に満たない
         return Result(
             code=cand.code,
             name=cand.name,
@@ -224,7 +250,7 @@ class Yahoo:
             close=latest.close,
             prev_high_date=prev.date if prev else None,
             prev_high_close=prev.close if prev else None,
-            oldest_checked=rows[-1].date,
+            oldest_checked=oldest,
         )
 
 
@@ -239,7 +265,7 @@ def write_outputs(results: list[Result], out_dir: Path, run_date: dt.date) -> tu
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["コード", "銘柄名", "市場", "日付", "終値", "前回高値日", "前回高値終値", "経過日数", "何年ぶり"])
+        w.writerow(["コード", "銘柄名", "市場", "日付", "終値", "前回高値日", "前回高値終値", "経過日数", "何年ぶり", "確認した最古日"])
         for r in results:
             w.writerow([
                 r.code, r.name, r.market, r.date.isoformat(), r.close,
@@ -247,6 +273,7 @@ def write_outputs(results: list[Result], out_dir: Path, run_date: dt.date) -> tu
                 r.prev_high_close if r.prev_high_close is not None else "",
                 r.days_since if r.days_since is not None else "",
                 r.gap_label,
+                r.oldest_checked.isoformat(),
             ])
 
     lines = [
