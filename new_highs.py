@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""株探 (https://kabutan.jp/) をソースに、終値ベースで「1年以上ぶり」に
-新高値を更新した銘柄をリストアップする。
+"""Yahoo!ファイナンス (https://finance.yahoo.co.jp/stocks) をソースに、
+終値ベースで「1年以上ぶり」に新高値を更新した銘柄をリストアップする。
 
 手順:
-  1. 株探の「本日、年初来高値を更新した銘柄」一覧 (/warning/?mode=3_1) から候補銘柄を取得する。
-  2. 各候補の日足時系列 (/stock/kabuka?code=XXXX&ashi=day) を新しい順に遡り、
-     最新終値「以上」の終値を付けた直近の日を探す。
-  3. その日が最新日から365日以上前（または取得できた範囲に存在しない）なら
+  1. 日本株ランキング「年初来高値更新」(/stocks/ranking/yearToDateHigh) から候補銘柄を取得する。
+  2. 各候補の時系列 (/quote/XXXX.T/history) を新しい順に遡り、
+     最新終値「以上」の終値を付けた直近の日を探す（株式分割を考慮した調整後終値で比較）。
+  3. その日が最新日から365日以上前（または遡れた範囲に存在しない）なら
      「終値ベースで1年以上ぶりの新高値」と判定する。
 
-注意: 株価の取得は大引け後（15:30 JST 以降）に実行すること。場中は最新行が
-途中値になる。
+注意: 大引け後（15:30 JST 以降）に実行すること。場中は最新行が途中値になる。
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import re
 import sys
 import time
@@ -27,14 +27,15 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://kabutan.jp"
-NEW_HIGH_LIST_URL = BASE_URL + "/warning/?mode=3_1"
-KABUKA_URL = BASE_URL + "/stock/kabuka?code={code}&ashi=day&page={page}"
+BASE_URL = "https://finance.yahoo.co.jp"
+RANKING_URL = BASE_URL + "/stocks/ranking/yearToDateHigh?market=all&term=daily&page={page}"
+HISTORY_URL = BASE_URL + "/quote/{code}.T/history?timeFrame=d&page={page}"
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
-CODE_RE = re.compile(r"code=([0-9A-Z]{4})")
+STATE_RE = re.compile(r"window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})\s*</script>", re.S)
+DATE_RE = re.compile(r"(\d{4})/(\d{1,2})/(\d{1,2})")
 
 
 @dataclass
@@ -47,7 +48,7 @@ class Candidate:
 @dataclass
 class PriceRow:
     date: dt.date
-    close: float
+    close: float  # 調整後終値
 
 
 @dataclass
@@ -95,50 +96,45 @@ def _to_float(text: str) -> float | None:
         return None
 
 
-def parse_candidates(html: str) -> list[Candidate]:
-    """年初来高値更新銘柄一覧ページから銘柄を抽出する。"""
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.select_one("table.stock_table") or soup
-    out: dict[str, Candidate] = {}
-    for tr in table.find_all("tr"):
-        link = tr.find("a", href=CODE_RE)
-        if not link:
-            continue
-        code = CODE_RE.search(link["href"]).group(1)
-        th = tr.find("th")
-        name = th.get_text(strip=True) if th else ""
-        tds = tr.find_all("td")
-        market = tds[1].get_text(strip=True) if len(tds) > 1 else ""
-        out.setdefault(code, Candidate(code, name, market))
-    return list(out.values())
+def parse_ranking(html: str) -> tuple[list[Candidate], bool]:
+    """ランキングページの埋め込み JSON から (銘柄一覧, 次ページ有無) を返す。"""
+    m = STATE_RE.search(html)
+    if not m:
+        raise ValueError("ランキングページに __PRELOADED_STATE__ が見つかりません")
+    state = json.loads(m.group(1))
+    ranking = state.get("mainRankingList") or {}
+    cands = [
+        Candidate(r["stockCode"], r.get("stockName", ""), r.get("marketName", ""))
+        for r in ranking.get("results") or []
+        if r.get("stockCode")
+    ]
+    has_next = bool((ranking.get("paging") or {}).get("hasNext"))
+    return cands, has_next
 
 
-def has_next_page(html: str, page: int) -> bool:
-    return f"page={page + 1}" in html
+def parse_history(html: str) -> list[PriceRow]:
+    """時系列ページの表 (#histlist) から (日付, 調整後終値) を新しい順に抽出する。
 
-
-def parse_daily_prices(html: str) -> list[PriceRow]:
-    """日足時系列ページから (日付, 終値) を新しい順に抽出する。
-
-    行は <th><time datetime="YYYY-MM-DD"></th><td>始値</td><td>高値</td>
-    <td>安値</td><td>終値</td>... の形式。
+    列: 日付 | 始値 | 高値 | 安値 | 終値 | 出来高 | 調整後終値 | PER | PBR
+    株式分割などの行（数値列が無い行）は無視する。
     """
     soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", id="histlist") or soup
     rows: dict[dt.date, PriceRow] = {}
-    for tr in soup.find_all("tr"):
-        t = tr.find("time", attrs={"datetime": True})
-        if not t:
-            continue
-        try:
-            date = dt.date.fromisoformat(t["datetime"][:10])
-        except ValueError:
+    for tr in table.find_all("tr"):
+        th = tr.find("th")
+        m = DATE_RE.search(th.get_text()) if th else None
+        if not m:
             continue
         tds = tr.find_all("td")
         if len(tds) < 4:
             continue
-        close = _to_float(tds[3].get_text())
+        close = _to_float(tds[5].get_text()) if len(tds) > 5 else None
+        if close is None:
+            close = _to_float(tds[3].get_text())
         if close is None:
             continue
+        date = dt.date(int(m[1]), int(m[2]), int(m[3]))
         rows.setdefault(date, PriceRow(date, close))
     return sorted(rows.values(), key=lambda r: r.date, reverse=True)
 
@@ -155,14 +151,13 @@ def find_prev_high(rows: list[PriceRow]) -> PriceRow | None:
     return None
 
 
-class Kabutan:
-    def __init__(self, sleep: float = 1.0, timeout: float = 20.0):
+class Yahoo:
+    def __init__(self, sleep: float = 1.0, timeout: float = 30.0):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
-            "Referer": BASE_URL + "/",
         })
         self.sleep = sleep
         self.timeout = timeout
@@ -174,9 +169,9 @@ class Kabutan:
                 resp = self.session.get(url, timeout=self.timeout)
                 if resp.status_code in (403, 405):
                     # WAF によるブロック。リトライしても変わらないので即失敗
-                    raise SystemExit(f"株探にアクセスを拒否されました (HTTP {resp.status_code}): {url}")
+                    raise SystemExit(f"アクセスを拒否されました (HTTP {resp.status_code}): {url}")
                 resp.raise_for_status()
-                resp.encoding = resp.apparent_encoding or "utf-8"
+                resp.encoding = "utf-8"
                 return resp.text
             except requests.RequestException as exc:
                 if attempt == 3:
@@ -186,15 +181,14 @@ class Kabutan:
                 time.sleep(wait)
         raise AssertionError("unreachable")
 
-    def candidates(self, max_pages: int = 20) -> list[Candidate]:
+    def candidates(self, max_pages: int = 50) -> list[Candidate]:
         out: dict[str, Candidate] = {}
         for page in range(1, max_pages + 1):
-            html = self.get(f"{NEW_HIGH_LIST_URL}&page={page}")
-            found = parse_candidates(html)
+            found, has_next = parse_ranking(self.get(RANKING_URL.format(page=page)))
             new = [c for c in found if c.code not in out]
             for c in new:
                 out[c.code] = c
-            if not new or not has_next_page(html, page):
+            if not new or not has_next:
                 break
         return list(out.values())
 
@@ -202,8 +196,8 @@ class Kabutan:
         rows: list[PriceRow] = []
         page = 1
         while True:
-            html = self.get(KABUKA_URL.format(code=cand.code, page=page))
-            got = [r for r in parse_daily_prices(html) if not rows or r.date < rows[-1].date]
+            got = parse_history(self.get(HISTORY_URL.format(code=cand.code, page=page)))
+            got = [r for r in got if not rows or r.date < rows[-1].date]
             if not got:
                 break
             rows.extend(got)
@@ -213,8 +207,6 @@ class Kabutan:
                     return None  # 1年以内に同等以上の終値あり
                 break
             if (rows[0].date - rows[-1].date).days >= max_years * 366:
-                break
-            if not has_next_page(html, page):
                 break
             page += 1
         if len(rows) < 2:
@@ -260,7 +252,7 @@ def write_outputs(results: list[Result], out_dir: Path, run_date: dt.date) -> tu
     lines = [
         f"# 終値ベースで1年以上ぶりに新高値を更新した銘柄 ({run_date.isoformat()})",
         "",
-        "ソース: [株探](https://kabutan.jp/) 「本日、年初来高値を更新した銘柄」＋各銘柄の日足時系列",
+        "ソース: [Yahoo!ファイナンス](https://finance.yahoo.co.jp/stocks) 「年初来高値更新」ランキング＋各銘柄の時系列（調整後終値）",
         "",
         f"該当 {len(results)} 銘柄",
         "",
@@ -270,7 +262,7 @@ def write_outputs(results: list[Result], out_dir: Path, run_date: dt.date) -> tu
     for r in results:
         prev = f"{r.prev_high_date.isoformat()} ({r.prev_high_close:,.1f})" if r.prev_high_date else "—"
         lines.append(
-            f"| [{r.code}](https://kabutan.jp/stock/?code={r.code}) | {r.name} | {r.market} "
+            f"| [{r.code}]({BASE_URL}/quote/{r.code}.T) | {r.name} | {r.market} "
             f"| {r.close:,.1f} | {prev} | {r.gap_label} |"
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -283,20 +275,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-years", type=int, default=5, help="「何年ぶり」を調べる最大遡及年数 (既定: 5)")
     p.add_argument("--sleep", type=float, default=1.0, help="リクエスト間隔 秒 (既定: 1.0)")
     p.add_argument("--out-dir", type=Path, default=Path("results"))
-    p.add_argument("--codes", nargs="*", help="候補一覧の代わりに指定コードのみ判定する")
+    p.add_argument("--codes", nargs="*", help="ランキングの代わりに指定コードのみ判定する")
     args = p.parse_args(argv)
 
-    kb = Kabutan(sleep=args.sleep)
+    yf = Yahoo(sleep=args.sleep)
     if args.codes:
         cands = [Candidate(c, "", "") for c in args.codes]
     else:
-        cands = kb.candidates()
+        cands = yf.candidates()
     print(f"候補 {len(cands)} 銘柄", file=sys.stderr)
 
     results: list[Result] = []
     for i, c in enumerate(cands, 1):
         try:
-            r = kb.check(c, args.min_days, args.max_years)
+            r = yf.check(c, args.min_days, args.max_years)
         except requests.RequestException as exc:
             print(f"[{i}/{len(cands)}] {c.code} 取得失敗: {exc}", file=sys.stderr)
             continue

@@ -1,4 +1,4 @@
-name: kabutan new highs (1y+, close basis)
+name: new highs 1y+ (close basis, Yahoo Finance)
 
 on:
   schedule:
@@ -23,13 +23,10 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -t .
-      - name: Check kabutan reachability
-        run: |
-          curl -sS -o /dev/null -w "kabutan status: %{http_code}\n" -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" -H "Accept-Language: ja" "https://kabutan.jp/warning/?mode=3_1" || true
-      - name: Scrape kabutan
+      - name: Scrape Yahoo Finance
         run: |
           set -o pipefail
-          python kabutan_new_highs.py --min-days "${{ github.event.inputs.min_days || '365' }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          python new_highs.py --min-days "${{ github.event.inputs.min_days || '365' }}" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Commit results
         if: success()
         run: |
