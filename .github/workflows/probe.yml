@@ -1,0 +1,15 @@
+name: probe yahoo
+on:
+  workflow_dispatch:
+  push:
+    paths: [tools/probe.py, .github/workflows/probe.yml]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests
+      - run: >
+          python tools/probe.py
+          "https://finance.yahoo.co.jp/stocks/ranking/yearToDateHigh?market=all&term=daily"
+          "https://finance.yahoo.co.jp/quote/7203.T/history?timeFrame=d&page=2"
